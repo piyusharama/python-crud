@@ -1,0 +1,81 @@
+pipeline {
+  agent any
+
+  options { timestamps(); ansiColor('xterm'); buildDiscarder(logRotator(numToKeepStr: '20')) }
+
+  parameters {
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to build')
+    string(name: 'DEPLOY_HOST', defaultValue: 'your.server.ip', description: 'Remote server to SSH into')
+    string(name: 'DEPLOY_PATH', defaultValue: '/opt/apps/python-crud', description: 'Compose directory on remote')
+    string(name: 'IMAGE_NAME', defaultValue: 'python-crud', description: 'Docker image name')
+    string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag')
+  }
+
+  environment {
+    SSH_CREDENTIALS = 'devserver_ssh'
+    REGISTRY = '' // e.g. ghcr.io/youruser or your ECR repo (leave blank for local)
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build Image') {
+      steps {
+        sh '''
+          set -e
+          IMG="${REGISTRY:+$REGISTRY/}${IMAGE_NAME}:${IMAGE_TAG}"
+          docker build -t "$IMG" .
+          docker image ls | head -n 10
+          echo "$IMG" > image.ref
+        '''
+        archiveArtifacts artifacts: 'image.ref', fingerprint: true
+      }
+    }
+
+    stage('Push (optional)') {
+      when { expression { return env.REGISTRY?.trim() } }
+      steps {
+        sh '''
+          set -e
+          IMG=$(cat image.ref)
+          docker push "$IMG"
+        '''
+      }
+    }
+
+    stage('Deploy (ssh docker-compose up -d)') {
+      steps {
+        sshagent (credentials: [env.SSH_CREDENTIALS]) {
+          sh '''
+            set -e
+            IMG=$(cat image.ref)
+            ssh -o StrictHostKeyChecking=no ${params.DEPLOY_HOST} "mkdir -p ${params.DEPLOY_PATH}"
+            scp -o StrictHostKeyChecking=no docker-compose.yml ${params.DEPLOY_HOST}:${params.DEPLOY_PATH}/
+            scp -o StrictHostKeyChecking=no .env || true ${params.DEPLOY_HOST}:${params.DEPLOY_PATH}/ || true
+
+            ssh -o StrictHostKeyChecking=no ${params.DEPLOY_HOST} bash -s <<REMOTE
+set -e
+cd ${params.DEPLOY_PATH}
+# Replace image in compose if REGISTRY used
+if [ -n "${REGISTRY}" ]; then
+  sed -i "s|image:.*|image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|" docker-compose.yml || true
+fi
+docker compose pull || true
+docker compose up -d --build
+docker compose ps
+REMOTE
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo 'Docker deploy successful.' }
+    failure { echo 'Docker deploy failed.' }
+  }
+}

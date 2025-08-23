@@ -1,0 +1,132 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  parameters {
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to build')
+    string(name: 'DEPLOY_HOST', defaultValue: 'your.server.ip', description: 'Remote server hostname or IP')
+    string(name: 'DEPLOY_PATH', defaultValue: '/opt/apps/python-crud', description: 'Absolute path on remote host')
+    string(name: 'PYTHON_BIN', defaultValue: 'python3', description: 'Python binary on remote host')
+    string(name: 'SERVICE_NAME', defaultValue: 'python-crud', description: 'systemd service name (if you use one)')
+  }
+
+  environment {
+    // Jenkins Credentials: add an SSH Username with private key credential id=devserver_ssh
+    SSH_CREDENTIALS = 'devserver_ssh'
+    // Optional: Secret .env stored in Jenkins (Secret Text) with id=flask_env_file
+    ENV_SECRET_ID = 'flask_env_file'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout([$class: 'GitSCM',
+          branches: [[name: "*/${params.BRANCH}"]],
+          userRemoteConfigs: [[url: scm.getUserRemoteConfigs()[0].getUrl()]]
+        ])
+      }
+    }
+
+    stage('Build (venv + deps)') {
+      steps {
+        sh '''
+          set -e
+          rm -rf .venv
+          ${params.PYTHON_BIN} -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          # basic sanity: import flask & render templates list
+          python - <<'PY'
+import importlib, os
+importlib.import_module('flask')
+print('Flask import OK')
+print('Templates:', os.listdir('templates'))
+PY
+        '''
+      }
+    }
+
+    stage('Package') {
+      steps {
+        sh '''
+          set -e
+          tar -czf artifact.tgz --exclude='.venv' --exclude='.git' --exclude='__pycache__' .
+          ls -lh artifact.tgz
+        '''
+        archiveArtifacts artifacts: 'artifact.tgz', fingerprint: true
+      }
+    }
+
+    stage('Deploy to Remote (SSH)') {
+      steps {
+        sshagent (credentials: [env.SSH_CREDENTIALS]) {
+          sh '''
+            set -e
+            # Create target dir and upload artifact
+            ssh -o StrictHostKeyChecking=no ${params.DEPLOY_HOST} "mkdir -p ${params.DEPLOY_PATH}"
+            scp -o StrictHostKeyChecking=no artifact.tgz ${params.DEPLOY_HOST}:${params.DEPLOY_PATH}/
+
+            # Write .env from Jenkins secret (if provided)
+            if [ -n "${ENV_SECRET_ID}" ]; then
+              echo "Attempting to fetch .env from Jenkins secret id=${ENV_SECRET_ID}"
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Remote Install & Restart') {
+      steps {
+        sshagent (credentials: [env.SSH_CREDENTIALS]) {
+          sh '''
+            set -e
+            ssh -o StrictHostKeyChecking=no ${params.DEPLOY_HOST} bash -s <<'REMOTE'
+set -e
+APP_DIR="${DEPLOY_PATH}"
+PY_BIN="${PYTHON_BIN}"
+SVC="${SERVICE_NAME}"
+
+cd "$APP_DIR"
+tar -xzf artifact.tgz
+rm -f artifact.tgz
+
+# Create/Update venv on remote
+if [ ! -d ".venv" ]; then
+  $PY_BIN -m venv .venv
+fi
+. .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# If you manage via systemd, restart service; else run a simple nohup gunicorn
+if systemctl list-unit-files | grep -q "^${SVC}.service"; then
+  sudo systemctl daemon-reload || true
+  sudo systemctl enable "${SVC}.service" || true
+  sudo systemctl restart "${SVC}.service"
+else
+  # Fallback quick-run: kill previous gunicorn, start new
+  pkill -f "gunicorn: master" || true
+  nohup .venv/bin/gunicorn -w 2 -b 0.0.0.0:8000 app:app >/tmp/${SVC}.log 2>&1 &
+fi
+REMOTE
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo 'Deployment successful.'
+    }
+    failure {
+      echo 'Build/Deploy failed.'
+    }
+  }
+}
